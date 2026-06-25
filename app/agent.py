@@ -1,26 +1,15 @@
-import os
+import json
 import re
-from collections.abc import AsyncGenerator
+import urllib.request
 from datetime import date
-from pathlib import Path
 
-import google.auth
-from dotenv import load_dotenv
 from google.adk.agents.context import Context
 from google.adk.apps import App
 from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
-from google.adk.events.request_input import RequestInput
-from google.adk.workflow import FunctionNode, RetryConfig, Workflow, node
-from google.genai import Client as GenaiClient
+from google.adk.workflow import FunctionNode, RetryConfig, Workflow
 from google.genai import types as genai_types
 from pydantic import BaseModel
-
-load_dotenv(Path(__file__).resolve().parent / ".env")
-
-_, project_id = google.auth.default()
-os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
-os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
 
 
 class ExpenseDetails(BaseModel):
@@ -103,6 +92,8 @@ def _extract_text(content: genai_types.Content) -> str:
 
 
 def classify_expense(ctx: Context, node_input: genai_types.Content) -> Event:
+    if "category_hint" in ctx.state:
+        return Event(output=ctx.state.get("original_text", ""))
     msg = _extract_text(node_input).lower()
     if any(w in msg for w in ["lunch", "dinner", "coffee", "food", "groceries"]):
         cat = "food"
@@ -116,7 +107,8 @@ def classify_expense(ctx: Context, node_input: genai_types.Content) -> Event:
         cat = "other"
     ctx.state["category_hint"] = cat
     ctx.state["today"] = today
-    return Event(output=_extract_text(node_input))
+    ctx.state["original_text"] = _extract_text(node_input)
+    return Event(output=ctx.state["original_text"])
 
 
 def security_check(ctx: Context, node_input: str) -> Event:
@@ -147,41 +139,17 @@ def security_check(ctx: Context, node_input: str) -> Event:
     return Event(output=scrubbed, actions=EventActions(route="safe"))
 
 
-@node(rerun_on_resume=True)
-async def security_alert(
-    ctx: Context, node_input: dict
-) -> AsyncGenerator[Event | RequestInput, None]:
-    if "security_review" not in ctx.resume_inputs:
-        yield RequestInput(
-            interrupt_id="security_review",
-            message=(
-                f"⚠️ SECURITY FLAG — Prompt injection detected\n\n"
-                f'Matched pattern: "{node_input["flagged_pattern"]}"\n'
-                f"Redacted categories: {node_input.get('redacted_categories', [])}\n"
-                f"\nOriginal message:\n{node_input['original']}\n"
-                f"\nScrubbed message:\n{node_input['scrubbed']}\n"
-                f"\nApprove or reject this expense?"
-            ),
-        )
-        return
-    resp = ctx.resume_inputs["security_review"]
-    if isinstance(resp, dict):
-        resp = resp.get("response", str(resp))
-    approved = resp.strip().lower() in ("yes", "y", "approve", "approved")
-    original = node_input.get("original", "")
-    match = _AMOUNT_RE.search(original)
-    amount = float(match.group(1).replace(",", "")) if match else 0.0
-    yield Event(
-        output={
-            "amount": amount,
-            "category": "security_flagged",
-            "date": today,
-            "merchant": "N/A",
-            "description": original,
-            "approved": approved,
-            "security_flag": None if approved else "prompt_injection",
-        }
+def security_alert(node_input: dict) -> dict:
+    node_input["needs_security_review"] = True
+    node_input["pending_message"] = (
+        f"⚠️ SECURITY FLAG — Prompt injection detected\n\n"
+        f'Matched pattern: "{node_input["flagged_pattern"]}"\n'
+        f"Redacted categories: {node_input.get('redacted_categories', [])}\n"
+        f"\nOriginal message:\n{node_input['original']}\n"
+        f"\nScrubbed message:\n{node_input['scrubbed']}\n"
+        f"\nApprove or reject this expense?"
     )
+    return node_input
 
 
 def check_amount(ctx: Context, node_input: ExpenseDetails) -> Event:
@@ -194,33 +162,29 @@ def check_amount(ctx: Context, node_input: ExpenseDetails) -> Event:
     return Event(output=node_input.model_dump(), actions=EventActions(route="auto"))
 
 
-@node(rerun_on_resume=True)
-async def approval_gate(
-    ctx: Context, node_input: dict
-) -> AsyncGenerator[Event | RequestInput, None]:
-    if "approve_expense" not in ctx.resume_inputs:
-        yield RequestInput(
-            interrupt_id="approve_expense",
-            message=(
-                f"Expense needs approval:\n"
-                f"  Amount:   ${node_input['amount']:.2f}\n"
-                f"  Merchant: {node_input['merchant']}\n"
-                f"  Category: {node_input['category']}\n"
-                f"  Date:     {node_input['date']}\n"
-                f"Approve? (yes/no)"
-            ),
-        )
-        return
-    resp = ctx.resume_inputs["approve_expense"]
-    if isinstance(resp, dict):
-        resp = resp.get("response", str(resp))
-    node_input["approved"] = resp.strip().lower() in ("yes", "y", "approve", "approved")
-    yield Event(output=node_input)
+def approval_gate(node_input: dict) -> dict:
+    node_input["needs_approval"] = True
+    node_input["pending_message"] = (
+        f"Expense needs approval:\n"
+        f"  Amount:   ${node_input['amount']:.2f}\n"
+        f"  Merchant: {node_input['merchant']}\n"
+        f"  Category: {node_input['category']}\n"
+        f"  Date:     {node_input['date']}\n"
+        f"Approve? (yes/no)"
+    )
+    return node_input
 
 
 def record_expense(node_input: dict) -> dict:
     global _next_id
-    security_flag = node_input.get("security_flag")
+    if node_input.get("needs_security_review"):
+        status = "pending_security_review"
+    elif node_input.get("needs_approval"):
+        status = "pending_approval"
+    elif not node_input.get("approved", True):
+        status = "not_approved"
+    else:
+        status = "approved"
     record = {
         "id": f"EXP-{_next_id:04d}",
         "amount": node_input.get("amount", 0.0),
@@ -228,12 +192,8 @@ def record_expense(node_input: dict) -> dict:
         "date": node_input.get("date", today),
         "merchant": node_input.get("merchant", "N/A"),
         "description": node_input.get("description", ""),
-        "status": (
-            "not_approved"
-            if not node_input.get("approved", True)
-            else "approved"
-        ),
-        "security_flag": security_flag,
+        "status": status,
+        "security_flag": node_input.get("security_flag"),
     }
     _expenses.append(record)
     _next_id += 1
@@ -255,10 +215,9 @@ def format_response(node_input: dict) -> str:
 # LLM call with retry
 # ---------------------------------------------------------------------------
 
-_genai_client = GenaiClient()
-
-
 def capture_details(ctx: Context, node_input: str) -> dict:
+    if "expense" in ctx.state:
+        return ctx.state["expense"]
     category_hint = ctx.state.get("category_hint", "other")
     prompt = (
         "Extract expense details from this text."
@@ -269,12 +228,20 @@ def capture_details(ctx: Context, node_input: str) -> dict:
         ' "merchant": str, "description": str}\n'
         f"Text: {node_input}"
     )
-    response = _genai_client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=prompt,
-        config={"response_mime_type": "application/json"},
+    payload = {
+        "model": "qwen2.5:7b",
+        "prompt": prompt,
+        "format": "json",
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        "http://localhost:11434/api/generate",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
     )
-    details = ExpenseDetails.model_validate_json(response.text)
+    with urllib.request.urlopen(req) as resp:
+        result = json.loads(resp.read().decode())
+    details = ExpenseDetails.model_validate_json(result["response"])
     ctx.state["expense"] = details.model_dump()
     return details.model_dump()
 
